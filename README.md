@@ -21,7 +21,7 @@ steamLensAI is built as a **distributed processing pipeline** that leverages par
 Topic Assignment using seed-values (Theme based categorization) and sentence-transformers
  > 1.2M reviews in 2 minutes, 30 seconds
 
-Summarization (Heirarchical Summarization) based on the now categorized data from the previous step:
+Summarization (Heirarchical Topic Based Summarization) based on the now categorized data from the previous step:
  > 1.2M reviews in 8 minutes
 
 The following are the Execution Time Metrics for the above mentioned data:
