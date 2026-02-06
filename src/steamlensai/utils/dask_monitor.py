@@ -107,7 +107,7 @@ class DaskMonitor:
             # Worker details
             st.subheader("Worker Status")
             worker_df = self.get_worker_status()
-            st.dataframe(worker_df, use_container_width=True)
+            st.dataframe(worker_df, width='stretch')
             
             # Dashboard link
             st.info(f"📊 [Open Dask Dashboard]({status['dashboard_link']}) for detailed monitoring")

@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import time
-import threading
 import datetime
+import os
 import streamlit as st
 import pandas as pd
 import dask
 import math
 from typing import Dict, Any, Optional, List, Tuple
-from dask.distributed import Client, LocalCluster
+from dask.distributed import Client, LocalCluster, as_completed
 
 from ..config.app_config import HARDWARE_CONFIG, DEFAULT_OUTPUT_PATH
-from .summarization import prepare_partition, process_partition, update_main_progress
+from .summarization import process_partition
 
 
 def _validate_report(final_report: pd.DataFrame) -> bool:
@@ -48,25 +48,38 @@ def _check_gpu_availability(status_text: Any) -> Tuple[bool, int, str]:
     else:
         status_text.write("No GPU detected, using CPU mode")
         device_count = 0
-        # Increase memory for CPU workers
-        memory_limit = HARDWARE_CONFIG['memory_per_worker'] * 1.5
+        memory_limit = HARDWARE_CONFIG['memory_per_worker']
     
     return gpu_available, device_count, memory_limit
 
 
-def _setup_dask_cluster(gpu_available: bool, memory_limit: str, status_text: Any, 
-                       dashboard_placeholder: Any) -> Tuple[LocalCluster, Client]:
+def _setup_dask_cluster(
+    gpu_available: bool,
+    device_count: int,
+    memory_limit: str,
+    status_text: Any,
+    dashboard_placeholder: Any
+) -> Tuple[LocalCluster, Client, int]:
     """Set up Dask cluster with optimized settings."""
-    # Allow more workers (up to 6) for GPU processing
-    worker_count = max(HARDWARE_CONFIG['worker_count'],8 if gpu_available else 4)
+    if gpu_available:
+        # One worker per visible GPU avoids CUDA contention on single-GPU machines.
+        worker_count = max(1, min(device_count, HARDWARE_CONFIG['worker_count']))
+        threads_per_worker = 1
+    else:
+        cpu_cap = max(1, (os.cpu_count() or 4) - 1)
+        worker_count = max(1, min(HARDWARE_CONFIG['worker_count'], cpu_cap))
+        threads_per_worker = 2
     
     cluster = LocalCluster(
         n_workers=worker_count, 
-        threads_per_worker=4,
+        threads_per_worker=threads_per_worker,
         memory_limit=memory_limit
     )
     client = Client(cluster)
-    status_text.write(f"Dask cluster initialized with {worker_count} workers")
+    status_text.write(
+        f"Dask cluster initialized with {worker_count} workers "
+        f"({threads_per_worker} threads/worker, memory_limit={memory_limit})"
+    )
     
     # Store client in session state for potential reset
     st.session_state.summarize_client = client
@@ -81,22 +94,20 @@ def _setup_dask_cluster(gpu_available: bool, memory_limit: str, status_text: Any
     if 'summarize_dashboard_link' not in st.session_state:
         st.session_state.summarize_dashboard_link = client.dashboard_link
     
-    return cluster, client
+    return cluster, client, worker_count
 
 
-def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: Any) -> List[dask.delayed]:
+def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: Any) -> List[pd.DataFrame]:
     """Create balanced partitions for distributed processing."""
     # ceiling‑divide so remainders aren’t dropped
     partition_size = math.ceil(len(final_report) / n_workers)
 
-    partitions = []
+    partitions: List[pd.DataFrame] = []
     idx = 0
     part = 0
     while idx < len(final_report):
         end_idx = min(idx + partition_size, len(final_report))
-        partitions.append(
-            dask.delayed(prepare_partition)(idx, end_idx, final_report)
-        )
+        partitions.append(final_report.iloc[idx:end_idx].copy())
         status_text.write(f"Prepared partition {part + 1} with {end_idx - idx} items")
         idx = end_idx
         part += 1
@@ -105,7 +116,7 @@ def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: 
 
 
 
-def _schedule_tasks(partitions: List[dask.delayed], hardware_config: Dict[str, Any]) -> List[dask.delayed]:
+def _schedule_tasks(partitions: List[pd.DataFrame], hardware_config: Dict[str, Any]) -> List[dask.delayed]:
     """Schedule summarization tasks for each partition."""
     delayed_results = []
     
@@ -123,25 +134,21 @@ def _compute_with_futures(client: Client, delayed_results: List[dask.delayed],
     try:
         # Submit tasks to cluster with async computation
         futures = client.compute(delayed_results)
-        
-        # Start progress monitor with minimal overhead
-        stop_flag = [False]  # Use a list to make it mutable for the thread
-        monitor_thread = threading.Thread(
-            target=update_main_progress, 
-            args=(futures, progress_bar, stop_flag, final_report_length)
-        )
-        monitor_thread.daemon = True
-        monitor_thread.start()
-        
-        # Wait for computation
         status_text.write("Computing sentiment-based summaries with optimal settings...")
-        results = client.gather(futures)
-        
-        # Stop progress monitor
-        stop_flag[0] = True
-        if monitor_thread.is_alive():
-            monitor_thread.join(timeout=3)
-        
+
+        if not futures:
+            return []
+
+        # Keep Streamlit widget updates on the main thread to avoid NoSessionContext.
+        future_order = {future: idx for idx, future in enumerate(futures)}
+        results: List[Any] = [None] * len(futures)
+        completed_count = 0
+        for completed_future in as_completed(futures):
+            idx = future_order[completed_future]
+            results[idx] = completed_future.result()
+            completed_count += 1
+            progress_bar.progress(completed_count / len(futures))
+
         return results
         
     except Exception as e:
@@ -272,10 +279,16 @@ def summarize_report(final_report: pd.DataFrame) -> Optional[pd.DataFrame]:
         gpu_available, device_count, memory_limit = _check_gpu_availability(status_text)
         
         # Setup Dask cluster
-        cluster, client = _setup_dask_cluster(gpu_available, memory_limit, status_text, dashboard_placeholder)
+        cluster, client, active_worker_count = _setup_dask_cluster(
+            gpu_available,
+            device_count,
+            memory_limit,
+            status_text,
+            dashboard_placeholder
+        )
         
         # Determine optimal partition sizes
-        n_workers = len(cluster.workers)  # Get the actual number of workers
+        n_workers = max(1, active_worker_count)
         partitions = _create_partitions(final_report, n_workers, status_text)
         
         # Schedule tasks

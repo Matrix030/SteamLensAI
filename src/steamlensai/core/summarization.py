@@ -52,7 +52,7 @@ def process_partition(partition_df: pd.DataFrame, worker_id: int, hardware_confi
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = AutoModelForSeq2SeqLM.from_pretrained(
             hardware_config['model_name'],
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
             device_map="auto",
             low_cpu_mem_usage=True
         )
@@ -134,14 +134,45 @@ def process_partition(partition_df: pd.DataFrame, worker_id: int, hardware_confi
             do_sample=False,
             num_beams=num_beams         # Use configurable beam search
         )[0]['summary_text']
+
+    def normalize_reviews(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v) for v in value if v is not None]
+        if isinstance(value, tuple):
+            return [str(v) for v in value if v is not None]
+        if isinstance(value, pd.Series):
+            return [str(v) for v in value.tolist() if v is not None]
+        if hasattr(value, "tolist"):
+            try:
+                raw = value.tolist()
+                if isinstance(raw, list):
+                    return [str(v) for v in raw if v is not None]
+            except Exception:
+                pass
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("[") and stripped.endswith("]"):
+                import ast
+                try:
+                    parsed = ast.literal_eval(stripped)
+                    if isinstance(parsed, list):
+                        return [str(v) for v in parsed if v is not None]
+                except Exception:
+                    return [stripped]
+            return [stripped]
+        return []
     
     # [Rest of the function remains the same...]
     results = []
     
     with tqdm(total=len(partition_df), desc=f"Worker {worker_id}", position=worker_id) as pbar:
         for idx, row in partition_df.iterrows():
-            positive_reviews = row['Positive_Reviews'] if isinstance(row['Positive_Reviews'], list) else []
-            negative_reviews = row['Negative_Reviews'] if isinstance(row['Negative_Reviews'], list) else []
+            positive_reviews = normalize_reviews(row.get('Positive_Reviews'))
+            negative_reviews = normalize_reviews(row.get('Negative_Reviews'))
             
             positive_summary = hierarchical_summary(positive_reviews) if positive_reviews else "No positive reviews available."
             negative_summary = hierarchical_summary(negative_reviews) if negative_reviews else "No negative reviews available."

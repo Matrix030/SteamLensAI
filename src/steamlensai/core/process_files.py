@@ -34,7 +34,9 @@ from sentence_transformers import SentenceTransformer
 from pathlib import Path
 import shutil
 import torch
+import pyarrow.parquet as pq
 from dask import delayed
+from collections.abc import Iterable
 
 # Import configuration and utility modules
 from ..config.app_config import (SENTENCE_TRANSFORMER_MODEL, PARQUET_COLUMNS, 
@@ -254,8 +256,8 @@ def process_uploaded_files(uploaded_files: List[Any], themes_file: str = "game_t
                 file_chunks = create_file_chunks(file_path, app_id, processing_config['chunk_size'])
                 
                 # Add unique IDs to each chunk for tracking
-                for start_row, end_row, file_path, app_id in file_chunks:
-                    chunk_info = (start_row, end_row, file_path, app_id, f"chunk_{chunk_id_counter}")
+                for file_path, app_id, row_group_slices in file_chunks:
+                    chunk_info = (file_path, app_id, row_group_slices, f"chunk_{chunk_id_counter}")
                     all_processing_chunks.append(chunk_info)
                     chunk_id_counter += 1
             
@@ -270,9 +272,9 @@ def process_uploaded_files(uploaded_files: List[Any], themes_file: str = "game_t
             delayed_processing_tasks = []
             task_submission_times = {}  # Track when each task was submitted
             
-            for start_row, end_row, file_path, app_id, chunk_id in all_processing_chunks:
+            for file_path, app_id, row_group_slices, chunk_id in all_processing_chunks:
                 # Create a delayed task to load the chunk data
-                chunk_loading_task = delayed(load_chunk_data)((start_row, end_row, file_path, app_id))
+                chunk_loading_task = delayed(load_chunk_data)((file_path, app_id, row_group_slices))
  
                 # Create a delayed task to process the chunk (load + topic assignment)
                 chunk_processing_task = process_chunk_delayed(
@@ -292,7 +294,7 @@ def process_uploaded_files(uploaded_files: List[Any], themes_file: str = "game_t
             computation_futures = dask_client.compute(delayed_processing_tasks)
             
             # Create a mapping from futures to chunk IDs for progress tracking
-            future_to_chunk_mapping = {computation_futures[i]: all_processing_chunks[i][4] for i in range(len(computation_futures))}
+            future_to_chunk_mapping = {computation_futures[i]: all_processing_chunks[i][3] for i in range(len(computation_futures))}
             
             # Step 10: Track progress as tasks complete
             completed_chunks_count = 0
@@ -394,10 +396,8 @@ def create_temp_storage() -> Dict[str, str]:
     Create temporary directory structure for storing intermediate processing results.
     
     During processing, we need to store partial results from each worker.
-    This function creates a temporary directory structure with separate folders for:
-    - Aggregation data (counts and metrics)
-    - Positive reviews
-    - Negative reviews  
+    This function creates a temporary directory structure with folders for:
+    - Aggregation data (counts + review text lists by topic)
     - Metadata
     
     Returns:
@@ -409,8 +409,6 @@ def create_temp_storage() -> Dict[str, str]:
     temp_folder_paths = {
         'base': temporary_base_directory,
         'aggregations': os.path.join(temporary_base_directory, 'aggregations'),
-        'positive_reviews': os.path.join(temporary_base_directory, 'positive_reviews'),
-        'negative_reviews': os.path.join(temporary_base_directory, 'negative_reviews'),
         'metadata': os.path.join(temporary_base_directory, 'metadata')
     }
     
@@ -469,54 +467,31 @@ def process_chunk_delayed(chunk_dataframe: pd.DataFrame, chunk_identifier: str, 
     # Assign topics/themes to each review in this chunk using machine learning
     chunk_with_assigned_topics = assign_topic(chunk_dataframe, game_themes_dict, sentence_embedder)
     
-    # Prepare data for aggregation (counting reviews by topic and sentiment)
+    # Build one aggregated output row per topic for this chunk.
     aggregation_data_rows = []
-    unique_topic_ids = chunk_with_assigned_topics['topic_id'].unique()
-    
-    # Process each topic found in this chunk
-    for topic_id in unique_topic_ids:
-        # Filter reviews for this specific topic
-        topic_specific_reviews = chunk_with_assigned_topics[chunk_with_assigned_topics['topic_id'] == topic_id]
-        
-        # Calculate basic statistics
-        total_review_count = len(topic_specific_reviews)
-        positive_reviews_count = topic_specific_reviews['voted_up'].sum()  # voted_up is True/False
-        negative_reviews_count = total_review_count - positive_reviews_count
-        
-        # Store aggregation data
+    for topic_id, topic_specific_reviews in chunk_with_assigned_topics.groupby('topic_id', sort=False):
+        total_review_count = int(len(topic_specific_reviews))
+        positive_mask = topic_specific_reviews['voted_up']
+        positive_reviews_list = topic_specific_reviews.loc[positive_mask, 'review'].tolist()
+        negative_reviews_list = topic_specific_reviews.loc[~positive_mask, 'review'].tolist()
+        positive_reviews_count = int(positive_mask.sum())  # voted_up is True/False
+
         aggregation_data_rows.append({
             'steam_appid': app_id,
-            'topic_id': topic_id,
+            'topic_id': int(topic_id),
             'review_count': total_review_count,
             'likes_sum': positive_reviews_count,
-            'dislikes_sum': negative_reviews_count
+            'dislikes_sum': total_review_count - positive_reviews_count,
+            'positive_reviews': positive_reviews_list,
+            'negative_reviews': negative_reviews_list
         })
-        
-        # Save positive reviews to a temporary file
-        positive_reviews_list = topic_specific_reviews[topic_specific_reviews['voted_up']]['review'].tolist()
-        if positive_reviews_list:
-            positive_reviews_filename = os.path.join(temp_storage_paths['positive_reviews'], 
-                                    f"chunk_{chunk_identifier}_app_{app_id}_topic_{topic_id}.parquet")
-            pd.DataFrame({
-                'steam_appid': app_id,
-                'topic_id': topic_id,
-                'reviews': [positive_reviews_list]  # Store as a single list in one row
-            }).to_parquet(positive_reviews_filename, compression='snappy')
-        
-        # Save negative reviews to a temporary file
-        negative_reviews_list = topic_specific_reviews[~topic_specific_reviews['voted_up']]['review'].tolist()
-        if negative_reviews_list:
-            negative_reviews_filename = os.path.join(temp_storage_paths['negative_reviews'], 
-                                    f"chunk_{chunk_identifier}_app_{app_id}_topic_{topic_id}.parquet")
-            pd.DataFrame({
-                'steam_appid': app_id,
-                'topic_id': topic_id,
-                'reviews': [negative_reviews_list]  # Store as a single list in one row
-            }).to_parquet(negative_reviews_filename, compression='snappy')
-    
-    # Save aggregation statistics to a temporary file
+
+    # Save one temp file per chunk to reduce filesystem fanout.
     if aggregation_data_rows:
-        aggregation_filename = os.path.join(temp_storage_paths['aggregations'], f"chunk_{chunk_identifier}_app_{app_id}.parquet")
+        aggregation_filename = os.path.join(
+            temp_storage_paths['aggregations'],
+            f"chunk_{chunk_identifier}_app_{app_id}.parquet"
+        )
         pd.DataFrame(aggregation_data_rows).to_parquet(aggregation_filename, compression='snappy')
     
     # Clean up memory before returning
@@ -527,12 +502,16 @@ def process_chunk_delayed(chunk_dataframe: pd.DataFrame, chunk_identifier: str, 
     return {
         'chunk_id': chunk_identifier,
         'processed_rows': len(chunk_dataframe),
-        'topics_found': len(unique_topic_ids),
+        'topics_found': len(aggregation_data_rows),
         'app_id': app_id
     }
 
 
-def create_file_chunks(file_path: str, app_id: int, chunk_size: int) -> List[Tuple[int, int, str, int]]:
+def create_file_chunks(
+    file_path: str,
+    app_id: int,
+    chunk_size: int
+) -> List[Tuple[str, int, List[Tuple[int, int, int]]]]:
     """
     Create chunk boundaries for a file without loading all the data into memory.
     
@@ -545,67 +524,97 @@ def create_file_chunks(file_path: str, app_id: int, chunk_size: int) -> List[Tup
         chunk_size: Number of rows per chunk
         
     Returns:
-        List of tuples: (start_row, end_row, file_path, app_id)
+        List of tuples: (file_path, app_id, row_group_slices)
 
     What Each Worker Will Do:
 
-    Worker 1: "I'll process Lethal Company reviews 0-4,999"
-    Worker 2: "I'll process Lethal Company reviews 5,000-9,999"
-    Worker 3: "I'll process Lethal Company reviews 10,000-14,999"
-    etc.er 3: "I'll process Lethal Company reviews 10,000-14,999"
+    Worker 1: "I'll process (row_group=0, rows 0-7499)"
+    Worker 2: "I'll process (row_group=0, rows 7500-14999)"
+    Worker 3: "I'll process (row_group=1, rows 0-7499)"
     """
-    # Read just enough data to count rows (not the full content)
-    file_info_sample = pd.read_parquet(file_path, columns=['steam_appid', 'review_language'])
-    
-    # Filter for English reviews from the specific game
-    filtered_info = file_info_sample[(file_info_sample['review_language'] == DEFAULT_LANGUAGE) & 
-                                   (file_info_sample['steam_appid'] == app_id)]
-    total_filtered_rows = len(filtered_info)
-    
-    # Clean up memory
-    del file_info_sample, filtered_info
-    gc.collect()
-    
-    # Create chunk boundaries (start and end row numbers)
-    #chunk_size = step_size
-    chunk_boundaries = []
-    for start_row in range(0, total_filtered_rows, chunk_size):
-        end_row = min(start_row + chunk_size, total_filtered_rows) # using min() if end of file is reached
-        chunk_boundaries.append((start_row, end_row, file_path, app_id))
-    
+    parquet_file = pq.ParquetFile(file_path)
+    matching_row_groups: List[Tuple[int, int]] = []
+
+    # Scan row groups once with only lightweight columns.
+    for row_group_idx in range(parquet_file.num_row_groups):
+        row_group_df = parquet_file.read_row_group(
+            row_group_idx,
+            columns=['steam_appid', 'review_language']
+        ).to_pandas()
+        matching_count = int(
+            (
+                (row_group_df['review_language'] == DEFAULT_LANGUAGE) &
+                (row_group_df['steam_appid'] == app_id)
+            ).sum()
+        )
+        if matching_count > 0:
+            matching_row_groups.append((row_group_idx, matching_count))
+
+    if not matching_row_groups:
+        return []
+
+    # Build chunks from filtered row slices so a single huge row-group can still parallelize.
+    chunk_boundaries: List[Tuple[str, int, List[Tuple[int, int, int]]]] = []
+    current_slices: List[Tuple[int, int, int]] = []
+    current_rows = 0
+
+    for row_group_idx, matching_count in matching_row_groups:
+        row_group_offset = 0
+        while row_group_offset < matching_count:
+            remaining = chunk_size - current_rows
+            take_rows = min(remaining, matching_count - row_group_offset)
+            current_slices.append(
+                (row_group_idx, row_group_offset, row_group_offset + take_rows)
+            )
+            current_rows += take_rows
+            row_group_offset += take_rows
+
+            if current_rows >= chunk_size:
+                chunk_boundaries.append((file_path, app_id, current_slices))
+                current_slices = []
+                current_rows = 0
+
+    if current_slices:
+        chunk_boundaries.append((file_path, app_id, current_slices))
+
     return chunk_boundaries
 
 
-def load_chunk_data(chunk_info: Tuple[int, int, str, int]) -> pd.DataFrame:
+def load_chunk_data(
+    chunk_info: Tuple[str, int, List[Tuple[int, int, int]]]
+) -> pd.DataFrame:
     """
     Load a specific chunk of data from a parquet file.
     
-    This function loads only the rows specified by the chunk boundaries,
+    This function loads only the parquet row groups assigned to the chunk,
     filters them for the correct language and game, and returns a clean DataFrame.
     
     Args:
-        chunk_info: Tuple containing (start_row, end_row, file_path, app_id)
+        chunk_info: Tuple containing (file_path, app_id, row_group_slices)
         
     Returns:
         Pandas DataFrame containing the filtered chunk data
     """
-    start_row, end_row, file_path, app_id = chunk_info
-    
-    # Read the entire file (we'll filter it next)
-    full_dataframe = pd.read_parquet(file_path, columns=PARQUET_COLUMNS)
-    
-    # Filter for English reviews from the specific game
-    filtered_dataframe = full_dataframe[(full_dataframe['review_language'] == DEFAULT_LANGUAGE) & 
-                                       (full_dataframe['steam_appid'] == app_id)]
-    
-    # Extract only the rows for this chunk
-    chunk_dataframe = filtered_dataframe.iloc[start_row:end_row].copy()
-    
-    # Clean up memory
-    del full_dataframe, filtered_dataframe
-    gc.collect()
-    
-    return chunk_dataframe
+    file_path, app_id, row_group_slices = chunk_info
+    parquet_file = pq.ParquetFile(file_path)
+    chunk_parts = []
+
+    for row_group_idx, slice_start, slice_end in row_group_slices:
+        row_group_df = parquet_file.read_row_group(
+            row_group_idx,
+            columns=PARQUET_COLUMNS
+        ).to_pandas()
+        filtered_row_group = row_group_df[
+            (row_group_df['review_language'] == DEFAULT_LANGUAGE) &
+            (row_group_df['steam_appid'] == app_id)
+        ]
+        if not filtered_row_group.empty:
+            chunk_parts.append(filtered_row_group.iloc[slice_start:slice_end].copy())
+
+    if not chunk_parts:
+        return pd.DataFrame(columns=PARQUET_COLUMNS)
+
+    return pd.concat(chunk_parts, ignore_index=True)
 
 
 def aggregate_temp_results(temp_storage_paths: Dict[str, str], game_themes_dict: Dict,
@@ -632,45 +641,61 @@ def aggregate_temp_results(temp_storage_paths: Dict[str, str], game_themes_dict:
     if not aggregation_files:
         return pd.DataFrame()
     
-    # Combine all aggregation data from different chunks
+    # Combine all chunk aggregation data (counts + review lists)
     all_aggregation_data = []
     for aggregation_file in aggregation_files:
         all_aggregation_data.append(pd.read_parquet(aggregation_file))
     
     combined_aggregation_data = pd.concat(all_aggregation_data)
-    
-    # Group by app_id and topic_id to combine counts from multiple chunks
+
+    def _normalize_reviews(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(v) for v in value if v is not None]
+        if isinstance(value, tuple):
+            return [str(v) for v in value if v is not None]
+        if isinstance(value, np.ndarray):
+            return [str(v) for v in value.tolist() if v is not None]
+        if isinstance(value, pd.Series):
+            return [str(v) for v in value.tolist() if v is not None]
+        if hasattr(value, "as_py"):
+            py_value = value.as_py()
+            return _normalize_reviews(py_value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("[") and stripped.endswith("]"):
+                import ast
+                try:
+                    parsed = ast.literal_eval(stripped)
+                    return _normalize_reviews(parsed)
+                except Exception:
+                    return [stripped]
+            return [stripped]
+        if isinstance(value, Iterable):
+            return [str(v) for v in value if v is not None]
+        return [str(value)]
+
+    def _merge_review_lists(series: pd.Series) -> List[str]:
+        merged_reviews: List[str] = []
+        for reviews in series:
+            normalized_reviews = _normalize_reviews(reviews)
+            if normalized_reviews:
+                merged_reviews.extend(normalized_reviews)
+        return merged_reviews
+
+    # Group by app/topic and merge both metrics and review text.
     final_aggregation = combined_aggregation_data.groupby(['steam_appid', 'topic_id']).agg({
         'review_count': 'sum',
         'likes_sum': 'sum',
-        'dislikes_sum': 'sum'
+        'dislikes_sum': 'sum',
+        'positive_reviews': _merge_review_lists,
+        'negative_reviews': _merge_review_lists
     }).reset_index()
-    
-    # Step 2: Collect positive reviews from all chunks
-    positive_reviews_by_topic = {}
-    positive_review_files = list(Path(temp_storage_paths['positive_reviews']).glob('*.parquet'))
-    
-    for positive_review_file in positive_review_files:
-        file_data = pd.read_parquet(positive_review_file)
-        for _, row in file_data.iterrows():
-            topic_key = (row['steam_appid'], row['topic_id'])
-            if topic_key not in positive_reviews_by_topic:
-                positive_reviews_by_topic[topic_key] = []
-            positive_reviews_by_topic[topic_key].extend(row['reviews'])
-    
-    # Step 3: Collect negative reviews from all chunks
-    negative_reviews_by_topic = {}
-    negative_review_files = list(Path(temp_storage_paths['negative_reviews']).glob('*.parquet'))
-    
-    for negative_review_file in negative_review_files:
-        file_data = pd.read_parquet(negative_review_file)
-        for _, row in file_data.iterrows():
-            topic_key = (row['steam_appid'], row['topic_id'])
-            if topic_key not in negative_reviews_by_topic:
-                negative_reviews_by_topic[topic_key] = []
-            negative_reviews_by_topic[topic_key].extend(row['reviews'])
-    
-    # Step 4: Build the final report with readable information
+
+    # Step 2: Build the final report with readable information
     final_report_rows = []
     
     for _, aggregation_row in final_aggregation.iterrows():
@@ -694,9 +719,8 @@ def aggregate_temp_results(temp_storage_paths: Dict[str, str], game_themes_dict:
             dislike_percentage = "0.0%"
         
         # Get the actual review text for this topic
-        topic_key = (steam_app_id, topic_id)
-        positive_reviews_for_topic = positive_reviews_by_topic.get(topic_key, [])
-        negative_reviews_for_topic = negative_reviews_by_topic.get(topic_key, [])
+        positive_reviews_for_topic = _normalize_reviews(aggregation_row.get('positive_reviews', []))
+        negative_reviews_for_topic = _normalize_reviews(aggregation_row.get('negative_reviews', []))
         
         # Add this row to the final report
         final_report_rows.append({
