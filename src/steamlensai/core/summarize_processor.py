@@ -62,8 +62,8 @@ def _setup_dask_cluster(
 ) -> Tuple[LocalCluster, Client, int]:
     """Set up Dask cluster with optimized settings."""
     if gpu_available:
-        # One worker per visible GPU avoids CUDA contention on single-GPU machines.
-        worker_count = max(1, min(device_count, HARDWARE_CONFIG['worker_count']))
+        # Mirror first-stage behavior: allow multiple workers to consume chunked tasks.
+        worker_count = max(1, min(HARDWARE_CONFIG['worker_count'], 6))
         threads_per_worker = 1
     else:
         cpu_cap = max(1, (os.cpu_count() or 4) - 1)
@@ -98,9 +98,10 @@ def _setup_dask_cluster(
 
 
 def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: Any) -> List[pd.DataFrame]:
-    """Create balanced partitions for distributed processing."""
-    # ceiling‑divide so remainders aren’t dropped
-    partition_size = math.ceil(len(final_report) / n_workers)
+    """Create chunked partitions for distributed processing."""
+    # Schedule more tasks than workers so the cluster can stay saturated.
+    target_partitions = max(1, n_workers * 2)
+    partition_size = max(1, math.ceil(len(final_report) / target_partitions))
 
     partitions: List[pd.DataFrame] = []
     idx = 0

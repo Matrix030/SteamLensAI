@@ -13,6 +13,49 @@ def prepare_partition(start_idx: int, end_idx: int, final_report: pd.DataFrame) 
     
     return final_report.iloc[start_idx:end_idx].copy()
 
+
+# Worker-local cache to avoid reloading model/tokenizer for every partition task.
+_SUMMARIZER_CACHE: Dict[Tuple[str, str], Any] = {}
+_MODEL_CACHE: Dict[Tuple[str, str], Any] = {}
+_TOKENIZER_CACHE: Dict[str, Any] = {}
+
+
+def _get_summarizer(hardware_config: Dict[str, Any]) -> Any:
+    model_name = hardware_config['model_name']
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cache_key = (model_name, device)
+    cached_summarizer = _SUMMARIZER_CACHE.get(cache_key)
+    if cached_summarizer is not None:
+        return cached_summarizer
+
+    tokenizer = _TOKENIZER_CACHE.get(model_name)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _TOKENIZER_CACHE[model_name] = tokenizer
+
+    model = _MODEL_CACHE.get(cache_key)
+    if model is None:
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name,
+            dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto",
+            low_cpu_mem_usage=True
+        )
+        _MODEL_CACHE[cache_key] = model
+
+    summarizer = pipeline(
+        task='summarization',
+        model=model,
+        tokenizer=tokenizer,
+        framework='pt',
+        model_kwargs={
+            "use_cache": True,
+            "return_dict_in_generate": True
+        }
+    )
+    _SUMMARIZER_CACHE[cache_key] = summarizer
+    return summarizer
+
 def process_partition(partition_df: pd.DataFrame, worker_id: int, hardware_config: Dict[str, Any], 
                      model_dataset_name: Optional[str] = None, 
                      tokenizer_dataset_name: Optional[str] = None) -> List[Tuple[int, str, str]]:
@@ -47,27 +90,18 @@ def process_partition(partition_df: pd.DataFrame, worker_id: int, hardware_confi
         else:
             model = model.to(device)
             print(f"Worker {worker_id} moved model to {device}")
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(hardware_config['model_name'])
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            hardware_config['model_name'],
-            dtype=torch.float16 if device == "cuda" else torch.float32,
-            device_map="auto",
-            low_cpu_mem_usage=True
+        summarizer = pipeline(
+            task='summarization',
+            model=model,
+            tokenizer=tokenizer,
+            framework='pt',
+            model_kwargs={
+                "use_cache": True,
+                "return_dict_in_generate": True
+            }
         )
-    
-    # Create optimized pipeline
-    summarizer = pipeline(
-        task='summarization',
-        model=model,
-        tokenizer=tokenizer,
-        framework='pt',
-        model_kwargs={
-            "use_cache": True,
-            "return_dict_in_generate": True
-        }
-    )
+    else:
+        summarizer = _get_summarizer(hardware_config)
     
     # Report GPU status if available
     if torch.cuda.is_available():
