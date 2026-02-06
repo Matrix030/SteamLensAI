@@ -1,0 +1,26 @@
+# Core dependencies
+streamlit>=1.22.0
+pandas>=1.5.0
+numpy>=1.23.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Distributed computing
+dask>=2023.3.0
+distributed>=2023.3.0
+tqdm>=4.64.0
+
+# Machine learning and NLP
+torch>=2.0.0
+torchvision>=0.15.0
+sentence-transformers>=2.2.2
+transformers>=4.28.0,<5.0.0
+scikit-learn>=1.2.0
+
+# File handlingpanel-809-6
+pyarrow>=12.0.0  # For parquet file support
+
+# Optional: GPU acceleration (uncomment if needed)
+accelerate>=0.20.0
+bokeh >=3.1.0
