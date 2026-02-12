@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-import time
+import contextlib
 import datetime
-import os
-import streamlit as st
-import pandas as pd
-import dask
 import math
-from typing import Dict, Any, Optional, List, Tuple
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+import dask
+import pandas as pd
+import streamlit as st
 from dask.distributed import Client, LocalCluster, as_completed
 
-from ..config.app_config import HARDWARE_CONFIG, DEFAULT_OUTPUT_PATH
+from ..config.app_config import DEFAULT_OUTPUT_PATH, HARDWARE_CONFIG
 from .summarization import process_partition
 
 
@@ -28,28 +29,35 @@ def _create_progress_indicators() -> Tuple[Any, Any, Any, Any, Any]:
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
     dashboard_placeholder = st.empty()
-    
+
     with progress_placeholder.container():
         status_text = st.empty()
         progress_bar = st.progress(0.0)
-    
-    return progress_placeholder, status_placeholder, dashboard_placeholder, status_text, progress_bar
+
+    return (
+        progress_placeholder,
+        status_placeholder,
+        dashboard_placeholder,
+        status_text,
+        progress_bar,
+    )
 
 
 def _check_gpu_availability(status_text: Any) -> Tuple[bool, int, str]:
     """Check GPU availability and return status information."""
     import torch
+
     gpu_available = torch.cuda.is_available()
-    
+
     if gpu_available:
         device_count = torch.cuda.device_count()
         status_text.write(f"GPU detected: {device_count} device(s) available")
-        memory_limit = HARDWARE_CONFIG['memory_per_worker']
+        memory_limit = HARDWARE_CONFIG["memory_per_worker"]
     else:
         status_text.write("No GPU detected, using CPU mode")
         device_count = 0
-        memory_limit = HARDWARE_CONFIG['memory_per_worker']
-    
+        memory_limit = HARDWARE_CONFIG["memory_per_worker"]
+
     return gpu_available, device_count, memory_limit
 
 
@@ -58,46 +66,46 @@ def _setup_dask_cluster(
     device_count: int,
     memory_limit: str,
     status_text: Any,
-    dashboard_placeholder: Any
+    dashboard_placeholder: Any,
 ) -> Tuple[LocalCluster, Client, int]:
     """Set up Dask cluster with optimized settings."""
     if gpu_available:
         # Mirror first-stage behavior: allow multiple workers to consume chunked tasks.
-        worker_count = max(1, min(HARDWARE_CONFIG['worker_count'], 6))
+        worker_count = max(1, min(HARDWARE_CONFIG["worker_count"], 6))
         threads_per_worker = 1
     else:
         cpu_cap = max(1, (os.cpu_count() or 4) - 1)
-        worker_count = max(1, min(HARDWARE_CONFIG['worker_count'], cpu_cap))
+        worker_count = max(1, min(HARDWARE_CONFIG["worker_count"], cpu_cap))
         threads_per_worker = 2
-    
+
     cluster = LocalCluster(
-        n_workers=worker_count, 
-        threads_per_worker=threads_per_worker,
-        memory_limit=memory_limit
+        n_workers=worker_count, threads_per_worker=threads_per_worker, memory_limit=memory_limit
     )
     client = Client(cluster)
     status_text.write(
         f"Dask cluster initialized with {worker_count} workers "
         f"({threads_per_worker} threads/worker, memory_limit={memory_limit})"
     )
-    
+
     # Store client in session state for potential reset
     st.session_state.summarize_client = client
-    
+
     # Display dashboard link for monitoring
     with dashboard_placeholder.container():
         st.success("✅ Dask Summarization Cluster Ready")
         st.markdown(f"**[Open Dask Dashboard]({client.dashboard_link})** (opens in new tab)")
         st.info("👁️ Monitor summarization tasks in real-time with this dashboard")
-    
+
     # Store dashboard link in session state
-    if 'summarize_dashboard_link' not in st.session_state:
+    if "summarize_dashboard_link" not in st.session_state:
         st.session_state.summarize_dashboard_link = client.dashboard_link
-    
+
     return cluster, client, worker_count
 
 
-def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: Any) -> List[pd.DataFrame]:
+def _create_partitions(
+    final_report: pd.DataFrame, n_workers: int, status_text: Any
+) -> List[pd.DataFrame]:
     """Create chunked partitions for distributed processing."""
     # Schedule more tasks than workers so the cluster can stay saturated.
     target_partitions = max(1, n_workers * 2)
@@ -116,21 +124,26 @@ def _create_partitions(final_report: pd.DataFrame, n_workers: int, status_text: 
     return partitions
 
 
-
-def _schedule_tasks(partitions: List[pd.DataFrame], hardware_config: Dict[str, Any]) -> List[dask.delayed]:
+def _schedule_tasks(
+    partitions: List[pd.DataFrame], hardware_config: Dict[str, Any]
+) -> List[dask.delayed]:
     """Schedule summarization tasks for each partition."""
     delayed_results = []
-    
+
     for i, partition in enumerate(partitions):
         delayed_result = dask.delayed(process_partition)(partition, i, hardware_config)
         delayed_results.append(delayed_result)
-    
+
     return delayed_results
 
 
-def _compute_with_futures(client: Client, delayed_results: List[dask.delayed], 
-                         progress_bar: Any, status_text: Any, 
-                         final_report_length: int) -> Optional[List]:
+def _compute_with_futures(
+    client: Client,
+    delayed_results: List[dask.delayed],
+    progress_bar: Any,
+    status_text: Any,
+    final_report_length: int,
+) -> Optional[List]:
     """Try to compute results using futures with progress monitoring."""
     try:
         # Submit tasks to cluster with async computation
@@ -143,22 +156,19 @@ def _compute_with_futures(client: Client, delayed_results: List[dask.delayed],
         # Keep Streamlit widget updates on the main thread to avoid NoSessionContext.
         future_order = {future: idx for idx, future in enumerate(futures)}
         results: List[Any] = [None] * len(futures)
-        completed_count = 0
-        for completed_future in as_completed(futures):
+        for completed_count, completed_future in enumerate(as_completed(futures), start=1):
             idx = future_order[completed_future]
             results[idx] = completed_future.result()
-            completed_count += 1
             progress_bar.progress(completed_count / len(futures))
 
         return results
-        
+
     except Exception as e:
         status_text.write(f"Error with futures: {e}")
         return None
 
 
-def _compute_with_fallback(delayed_results: List[dask.delayed], 
-                          status_text: Any) -> Optional[List]:
+def _compute_with_fallback(delayed_results: List[dask.delayed], status_text: Any) -> Optional[List]:
     """Fallback computation method without futures."""
     status_text.write("Falling back to direct computation...")
     try:
@@ -174,45 +184,52 @@ def _process_results(results: List, status_text: Any) -> Optional[List[Tuple[int
     if results is None:
         status_text.write("❌ Failed to generate summaries")
         return None
-    
+
     # Process results efficiently
     all_results = []
     for worker_results in results:
         if worker_results:  # Check if we got valid results
             all_results.extend(worker_results)
-    
+
     if not all_results:
         status_text.write("❌ No valid results generated")
         return None
-    
+
     # Sort results
     all_results.sort(key=lambda x: x[0])
-    
+
     return all_results
 
 
-def _merge_summaries_with_report(final_report: pd.DataFrame, 
-                                all_results: List[Tuple[int, str, str]]) -> pd.DataFrame:
+def _merge_summaries_with_report(
+    final_report: pd.DataFrame, all_results: List[Tuple[int, str, str]]
+) -> pd.DataFrame:
     """Merge computed summaries with the original report."""
     # Extract positive and negative summaries
     indices = [result[0] for result in all_results]
     positive_summaries = [result[1] for result in all_results]
     negative_summaries = [result[2] for result in all_results]
-    
+
     # Create a new DataFrame with the results
-    result_df = pd.DataFrame({
-        'index': indices,
-        'Positive_Summary': positive_summaries,
-        'Negative_Summary': negative_summaries
-    }).set_index('index')
-    
+    result_df = pd.DataFrame(
+        {
+            "index": indices,
+            "Positive_Summary": positive_summaries,
+            "Negative_Summary": negative_summaries,
+        }
+    ).set_index("index")
+
     # Merge with the original DataFrame
-    final_report = final_report.join(result_df[['Positive_Summary', 'Negative_Summary']])
-    
+    final_report = final_report.join(result_df[["Positive_Summary", "Negative_Summary"]])
+
     # Fill any missing values (for rows that weren't processed)
-    final_report['Positive_Summary'] = final_report['Positive_Summary'].fillna("Summary not available")
-    final_report['Negative_Summary'] = final_report['Negative_Summary'].fillna("Summary not available")
-    
+    final_report["Positive_Summary"] = final_report["Positive_Summary"].fillna(
+        "Summary not available"
+    )
+    final_report["Negative_Summary"] = final_report["Negative_Summary"].fillna(
+        "Summary not available"
+    )
+
     return final_report
 
 
@@ -227,13 +244,14 @@ def _save_results(final_report: pd.DataFrame, status_text: Any) -> bool:
         return False
 
 
-def _report_timing_metrics(start_time: float, phase_start_time: float, 
-                          final_report_length: int, status_text: Any) -> None:
+def _report_timing_metrics(
+    start_time: float, phase_start_time: float, final_report_length: int, status_text: Any
+) -> None:
     """Report timing metrics for the summarization process."""
     elapsed_time = time.time() - start_time
     status_text.write(f"✅ **EXECUTION TIME:** {elapsed_time:.2f} seconds")
-    status_text.write(f"✅ Average time per item: {elapsed_time/final_report_length:.4f} seconds")
-    
+    status_text.write(f"✅ Average time per item: {elapsed_time / final_report_length:.4f} seconds")
+
     # Calculate elapsed time for this phase
     phase_elapsed_time = time.time() - phase_start_time
     formatted_time = str(datetime.timedelta(seconds=int(phase_elapsed_time)))
@@ -243,96 +261,94 @@ def _report_timing_metrics(start_time: float, phase_start_time: float,
 def _cleanup_resources(client: Optional[Client], cluster: Optional[LocalCluster]) -> None:
     """Clean up Dask resources."""
     if client:
-        try:
+        with contextlib.suppress(BaseException):
             client.close()
-        except:
-            pass
     if cluster:
-        try:
+        with contextlib.suppress(BaseException):
             cluster.close()
-        except:
-            pass
 
 
 def summarize_report(final_report: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Main function to summarize the sentiment report."""
     # Start phase timer
     phase_start_time = time.time()
-    
+
     # Validate report
     if not _validate_report(final_report):
         return None
-    
+
     # Create progress indicators
-    progress_placeholder, status_placeholder, dashboard_placeholder, status_text, progress_bar = _create_progress_indicators()
-    
+    progress_placeholder, status_placeholder, dashboard_placeholder, status_text, progress_bar = (
+        _create_progress_indicators()
+    )
+
     # Use hardware_config from config module
     hardware_config = HARDWARE_CONFIG
-    
-    status_text.write(f"Starting optimized Dask cluster for sentiment-based summarization")
-    
+
+    status_text.write("Starting optimized Dask cluster for sentiment-based summarization")
+
     # Use try/finally to ensure proper cleanup of Dask resources
     cluster = None
     client = None
-    
+
     try:
         # Check GPU availability
         gpu_available, device_count, memory_limit = _check_gpu_availability(status_text)
-        
+
         # Setup Dask cluster
         cluster, client, active_worker_count = _setup_dask_cluster(
-            gpu_available,
-            device_count,
-            memory_limit,
-            status_text,
-            dashboard_placeholder
+            gpu_available, device_count, memory_limit, status_text, dashboard_placeholder
         )
-        
+
         # Determine optimal partition sizes
         n_workers = max(1, active_worker_count)
         partitions = _create_partitions(final_report, n_workers, status_text)
-        
+
         # Schedule tasks
-        status_text.write(f"Scheduling {len(partitions)} optimized partitions for sentiment analysis...")
+        status_text.write(
+            f"Scheduling {len(partitions)} optimized partitions for sentiment analysis..."
+        )
         delayed_results = _schedule_tasks(partitions, hardware_config)
-        
+
         # Start timing
         start_time = time.time()
-        
+
         # Try to compute with futures first
-        results = _compute_with_futures(client, delayed_results, progress_bar, 
-                                       status_text, len(final_report))
-        
+        results = _compute_with_futures(
+            client, delayed_results, progress_bar, status_text, len(final_report)
+        )
+
         # If futures failed, try fallback method
         if results is None:
             results = _compute_with_fallback(delayed_results, status_text)
-        
+
         # Update progress to completion
         progress_bar.progress(1.0)
-        
+
         # Process results
         all_results = _process_results(results, status_text)
         if all_results is None:
             return None
-        
+
         # Merge summaries with report
         final_report = _merge_summaries_with_report(final_report, all_results)
-        
+
         # Report timing metrics
         _report_timing_metrics(start_time, phase_start_time, len(final_report), status_text)
-        
+
         # Save results
         _save_results(final_report, status_text)
-        
+
         return final_report
-        
+
     except Exception as e:
         # Handle any unexpected errors
         status_text.write(f"❌ Error during summarization: {str(e)}")
         import traceback
+
         status_text.write(f"Error details: {traceback.format_exc()}")
         return None
-        
+
     finally:
         # Clean up resources
         _cleanup_resources(client, cluster)

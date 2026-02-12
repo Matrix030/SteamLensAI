@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check (auto-fix)
+        entry: uv tool run ruff check --fix --unsafe-fixes --ignore C901
+        language: system
+        files: ^steamlensai/core/
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv tool run ruff format
+        language: system
+        files: ^steamlensai/core/
+        types: [python]

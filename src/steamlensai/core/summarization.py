@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 
-import torch
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
+import torch
 from tqdm.auto import tqdm
-from typing import List, Dict, Tuple, Any, Union, Optional
-from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-from dask.distributed import Future
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
 
 def prepare_partition(start_idx: int, end_idx: int, final_report: pd.DataFrame) -> pd.DataFrame:
-    
+
     return final_report.iloc[start_idx:end_idx].copy()
 
 
@@ -21,7 +21,7 @@ _TOKENIZER_CACHE: Dict[str, Any] = {}
 
 
 def _get_summarizer(hardware_config: Dict[str, Any]) -> Any:
-    model_name = hardware_config['model_name']
+    model_name = hardware_config["model_name"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cache_key = (model_name, device)
     cached_summarizer = _SUMMARIZER_CACHE.get(cache_key)
@@ -39,206 +39,224 @@ def _get_summarizer(hardware_config: Dict[str, Any]) -> Any:
             model_name,
             dtype=torch.float16 if device == "cuda" else torch.float32,
             device_map="auto",
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
         )
         _MODEL_CACHE[cache_key] = model
 
     summarizer = pipeline(
-        task='summarization',
+        task="summarization",
         model=model,
         tokenizer=tokenizer,
-        framework='pt',
-        model_kwargs={
-            "use_cache": True,
-            "return_dict_in_generate": True
-        }
+        framework="pt",
+        model_kwargs={"use_cache": True, "return_dict_in_generate": True},
     )
     _SUMMARIZER_CACHE[cache_key] = summarizer
     return summarizer
 
-def process_partition(partition_df: pd.DataFrame, worker_id: int, hardware_config: Dict[str, Any], 
-                     model_dataset_name: Optional[str] = None, 
-                     tokenizer_dataset_name: Optional[str] = None) -> List[Tuple[int, str, str]]:
-    
-    
-    # Import needed packages
-    from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-    import torch
+
+def _summary_kwargs(hardware_config: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "max_length": hardware_config.get("max_summary_length", 150),
+        "min_length": hardware_config.get("min_summary_length", 40),
+        "truncation": True,
+        "do_sample": False,
+        "num_beams": hardware_config.get("num_beams", 4),
+    }
+
+
+def _build_published_dataset_summarizer(
+    worker_id: int, model_dataset_name: str, tokenizer_dataset_name: str
+) -> Any:
     from dask.distributed import get_worker
-    
-    # Get summary length parameters from config (with fallback defaults)
-    max_length = hardware_config.get('max_summary_length', 150)  # Increased default
-    min_length = hardware_config.get('min_summary_length', 40)   # Increased default
-    num_beams = hardware_config.get('num_beams', 4)              # Better quality
-    
-    print(f"Worker {worker_id} using summary lengths: min={min_length}, max={max_length}, beams={num_beams}")
-    
-    # Load model components with optimal settings
-    print(f"Worker {worker_id} initializing with optimized settings")
-    
-    # [Previous model loading code remains the same...]
-    if model_dataset_name is not None and tokenizer_dataset_name is not None:
-        worker = get_worker()
-        model = worker.client.get_dataset(model_dataset_name)
-        tokenizer = worker.client.get_dataset(tokenizer_dataset_name)
-        print(f"Worker {worker_id} using model and tokenizer from published datasets")
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            model = model.to(device).half()
-            print(f"Worker {worker_id} moved model to {device} with half precision")
-        else:
-            model = model.to(device)
-            print(f"Worker {worker_id} moved model to {device}")
-        summarizer = pipeline(
-            task='summarization',
-            model=model,
-            tokenizer=tokenizer,
-            framework='pt',
-            model_kwargs={
-                "use_cache": True,
-                "return_dict_in_generate": True
-            }
-        )
+
+    worker = get_worker()
+    model = worker.client.get_dataset(model_dataset_name)
+    tokenizer = worker.client.get_dataset(tokenizer_dataset_name)
+    print(f"Worker {worker_id} using model and tokenizer from published datasets")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        model = model.to(device).half()
+        print(f"Worker {worker_id} moved model to {device} with half precision")
     else:
-        summarizer = _get_summarizer(hardware_config)
-    
-    # Report GPU status if available
+        model = model.to(device)
+        print(f"Worker {worker_id} moved model to {device}")
+
+    return pipeline(
+        task="summarization",
+        model=model,
+        tokenizer=tokenizer,
+        framework="pt",
+        model_kwargs={"use_cache": True, "return_dict_in_generate": True},
+    )
+
+
+def _resolve_partition_summarizer(
+    worker_id: int,
+    hardware_config: Dict[str, Any],
+    model_dataset_name: Optional[str],
+    tokenizer_dataset_name: Optional[str],
+) -> Any:
+    if model_dataset_name is None or tokenizer_dataset_name is None:
+        return _get_summarizer(hardware_config)
+    return _build_published_dataset_summarizer(
+        worker_id, model_dataset_name, tokenizer_dataset_name
+    )
+
+
+def _normalize_reviews(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    if isinstance(value, tuple):
+        return [str(v) for v in value if v is not None]
+    if isinstance(value, pd.Series):
+        return [str(v) for v in value.tolist() if v is not None]
+    if hasattr(value, "tolist"):
+        try:
+            raw = value.tolist()
+            if isinstance(raw, list):
+                return [str(v) for v in raw if v is not None]
+        except Exception:
+            return []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("[") and stripped.endswith("]"):
+            import ast
+
+            try:
+                parsed = ast.literal_eval(stripped)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed if v is not None]
+            except Exception:
+                return [stripped]
+        return [stripped]
+    return []
+
+
+def _process_chunks_batched(
+    chunks: List[str], summarizer: Any, hardware_config: Dict[str, Any], kwargs: Dict[str, Any]
+) -> List[str]:
+    all_summaries: List[str] = []
+    batch_size = hardware_config["gpu_batch_size"]
+
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        batch_summaries = summarizer(batch, **kwargs)
+        all_summaries.extend(summary["summary_text"] for summary in batch_summaries)
+
+        if start % (batch_size * 3) == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return all_summaries
+
+
+def _hierarchical_summary(
+    reviews: List[str], summarizer: Any, hardware_config: Dict[str, Any], kwargs: Dict[str, Any]
+) -> str:
+    if not reviews:
+        return "No reviews available for summarization."
+
+    if len(reviews) <= hardware_config["chunk_size"]:
+        return summarizer("\n\n".join(reviews), **kwargs)[0]["summary_text"]
+
+    chunk_size = hardware_config["chunk_size"]
+    review_chunks = [
+        "\n\n".join(reviews[i : i + chunk_size]) for i in range(0, len(reviews), chunk_size)
+    ]
+    intermediate_summaries = _process_chunks_batched(
+        review_chunks, summarizer, hardware_config, kwargs
+    )
+    return summarizer(" ".join(intermediate_summaries), **kwargs)[0]["summary_text"]
+
+
+def _summarize_partition_rows(
+    partition_df: pd.DataFrame,
+    worker_id: int,
+    summarizer: Any,
+    hardware_config: Dict[str, Any],
+    kwargs: Dict[str, Any],
+) -> List[Tuple[int, str, str]]:
+    results: List[Tuple[int, str, str]] = []
+    with tqdm(total=len(partition_df), desc=f"Worker {worker_id}", position=worker_id) as pbar:
+        for idx, row in partition_df.iterrows():
+            positive_reviews = _normalize_reviews(row.get("Positive_Reviews"))
+            negative_reviews = _normalize_reviews(row.get("Negative_Reviews"))
+
+            positive_summary = (
+                _hierarchical_summary(positive_reviews, summarizer, hardware_config, kwargs)
+                if positive_reviews
+                else "No positive reviews available."
+            )
+            negative_summary = (
+                _hierarchical_summary(negative_reviews, summarizer, hardware_config, kwargs)
+                if negative_reviews
+                else "No negative reviews available."
+            )
+            results.append((idx, positive_summary, negative_summary))
+
+            if (
+                len(results) % hardware_config["cleanup_frequency"] == 0
+                and torch.cuda.is_available()
+            ):
+                torch.cuda.empty_cache()
+            pbar.update(1)
+    return results
+
+
+def process_partition(
+    partition_df: pd.DataFrame,
+    worker_id: int,
+    hardware_config: Dict[str, Any],
+    model_dataset_name: Optional[str] = None,
+    tokenizer_dataset_name: Optional[str] = None,
+) -> List[Tuple[int, str, str]]:
+    kwargs = _summary_kwargs(hardware_config)
+    print(
+        "Worker "
+        f"{worker_id} using summary lengths: min={kwargs['min_length']}, "
+        f"max={kwargs['max_length']}, beams={kwargs['num_beams']}"
+    )
+    print(f"Worker {worker_id} initializing with optimized settings")
+
+    summarizer = _resolve_partition_summarizer(
+        worker_id, hardware_config, model_dataset_name, tokenizer_dataset_name
+    )
     if torch.cuda.is_available():
         gpu_mem = torch.cuda.memory_allocated(0) / (1024**3)
         print(f"Worker {worker_id}: GPU Memory: {gpu_mem:.2f}GB allocated")
-    
-    # Updated batch processing function with configurable parameters
-    def process_chunks_batched(chunks: List[str]) -> List[str]:
-        """Process chunks in large batches for GPU with configurable summary length"""
-        all_summaries = []
-        
-        for i in range(0, len(chunks), hardware_config['gpu_batch_size']):
-            batch = chunks[i:i+hardware_config['gpu_batch_size']]
-            batch_summaries = summarizer(
-                batch,
-                max_length=max_length,      # Use configurable max length
-                min_length=min_length,      # Use configurable min length
-                truncation=True,
-                do_sample=False,
-                num_beams=num_beams         # Use configurable beam search
-            )
-            all_summaries.extend([s["summary_text"] for s in batch_summaries])
-            
-            if i % (hardware_config['gpu_batch_size'] * 3) == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                    
-        return all_summaries
-    
-    # Updated hierarchical summary function with configurable length
-    def hierarchical_summary(reviews: List[str]) -> str:
-        """Create hierarchical summary with configurable length"""
-        if not reviews or not isinstance(reviews, list) or len(reviews) == 0:
-            return "No reviews available for summarization."
-        
-        # Fast path for small review sets
-        if len(reviews) <= hardware_config['chunk_size']:
-            doc = "\n\n".join(reviews)
-            return summarizer(
-                doc,
-                max_length=max_length,      # Use configurable max length
-                min_length=min_length,      # Use configurable min length
-                truncation=True,
-                do_sample=False,
-                num_beams=num_beams         # Use configurable beam search
-            )[0]['summary_text']
-        
-        # Process larger review sets with optimized chunking
-        all_chunks = []
-        for i in range(0, len(reviews), hardware_config['chunk_size']):
-            batch = reviews[i:i+hardware_config['chunk_size']]
-            text = "\n\n".join(batch)
-            all_chunks.append(text)
-        
-        # Process chunks with optimized batching
-        intermediate_summaries = process_chunks_batched(all_chunks)
-        
-        # Create final summary with longer length
-        joined = " ".join(intermediate_summaries)
-        return summarizer(
-            joined,
-            max_length=max_length,      # Use configurable max length
-            min_length=min_length,      # Use configurable min length
-            truncation=True,
-            do_sample=False,
-            num_beams=num_beams         # Use configurable beam search
-        )[0]['summary_text']
 
-    def normalize_reviews(value: Any) -> List[str]:
-        if value is None:
-            return []
-        if isinstance(value, list):
-            return [str(v) for v in value if v is not None]
-        if isinstance(value, tuple):
-            return [str(v) for v in value if v is not None]
-        if isinstance(value, pd.Series):
-            return [str(v) for v in value.tolist() if v is not None]
-        if hasattr(value, "tolist"):
-            try:
-                raw = value.tolist()
-                if isinstance(raw, list):
-                    return [str(v) for v in raw if v is not None]
-            except Exception:
-                pass
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return []
-            if stripped.startswith("[") and stripped.endswith("]"):
-                import ast
-                try:
-                    parsed = ast.literal_eval(stripped)
-                    if isinstance(parsed, list):
-                        return [str(v) for v in parsed if v is not None]
-                except Exception:
-                    return [stripped]
-            return [stripped]
-        return []
-    
-    # [Rest of the function remains the same...]
-    results = []
-    
-    with tqdm(total=len(partition_df), desc=f"Worker {worker_id}", position=worker_id) as pbar:
-        for idx, row in partition_df.iterrows():
-            positive_reviews = normalize_reviews(row.get('Positive_Reviews'))
-            negative_reviews = normalize_reviews(row.get('Negative_Reviews'))
-            
-            positive_summary = hierarchical_summary(positive_reviews) if positive_reviews else "No positive reviews available."
-            negative_summary = hierarchical_summary(negative_reviews) if negative_reviews else "No negative reviews available."
-            
-            results.append((idx, positive_summary, negative_summary))
-            
-            if len(results) % hardware_config['cleanup_frequency'] == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                
-            pbar.update(1)
-    
+    results = _summarize_partition_rows(
+        partition_df, worker_id, summarizer, hardware_config, kwargs
+    )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    
+
     print(f"Worker {worker_id} completed successfully")
     return results
 
-def update_main_progress(futures: List[Any], progress_bar: Any, stop_flag: List[bool], final_report_length: int) -> None:
-    
+
+def update_main_progress(
+    futures: List[Any], progress_bar: Any, stop_flag: List[bool], final_report_length: int
+) -> None:
+
     import time
+
     start_time = time.time()
-    
+
     while not stop_flag[0]:
         # Count completed futures
-        completed_count = sum(f.status == 'finished' for f in futures)
+        completed_count = sum(f.status == "finished" for f in futures)
         completed_percentage = completed_count / len(futures) if len(futures) > 0 else 0
-        
+
         # Update progress bar
         progress_bar.progress(completed_percentage)
-        
+
         # Calculate elapsed time
-        elapsed_time = time.time() - start_time
-        
+        time.time() - start_time
+
         # Only check every 2 seconds to reduce overhead
-        time.sleep(2) 
+        time.sleep(2)

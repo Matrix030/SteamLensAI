@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
-from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Per-worker caches. Dask workers run in separate processes, so this is safe and local.
 _THEME_EMBEDDING_CACHE: Dict[Tuple[int, int], np.ndarray] = {}
@@ -25,9 +24,7 @@ def _ensure_embedder_device(embedder: SentenceTransformer) -> None:
 
 
 def _build_theme_embedding(
-    appid: int,
-    game_themes: Dict[int, Dict[str, List[str]]],
-    embedder: SentenceTransformer
+    appid: int, game_themes: Dict[int, Dict[str, List[str]]], embedder: SentenceTransformer
 ) -> np.ndarray:
     theme_seed_lists = list(game_themes.get(appid, {}).values())
     if not theme_seed_lists:
@@ -44,10 +41,7 @@ def _build_theme_embedding(
         return np.empty((0, 0), dtype=np.float32)
 
     seed_embeddings = embedder.encode(
-        all_seeds,
-        convert_to_numpy=True,
-        batch_size=64,
-        show_progress_bar=False
+        all_seeds, convert_to_numpy=True, batch_size=64, show_progress_bar=False
     )
 
     theme_embeddings: List[np.ndarray] = []
@@ -64,9 +58,7 @@ def _build_theme_embedding(
 
 
 def get_theme_embeddings(
-    app_ids: List[int],
-    game_themes: Dict[int, Dict[str, List[str]]],
-    embedder: SentenceTransformer
+    app_ids: List[int], game_themes: Dict[int, Dict[str, List[str]]], embedder: SentenceTransformer
 ) -> Dict[int, np.ndarray]:
     _ensure_embedder_device(embedder)
 
@@ -86,33 +78,34 @@ def get_theme_embeddings(
 
     return embeddings
 
-def assign_topic(df_partition: pd.DataFrame, game_themes: Dict[int, Dict[str, List[str]]], 
-                 embedder: SentenceTransformer) -> pd.DataFrame:
-    
+
+def assign_topic(
+    df_partition: pd.DataFrame,
+    game_themes: Dict[int, Dict[str, List[str]]],
+    embedder: SentenceTransformer,
+) -> pd.DataFrame:
+
     # If no rows, return as-is
     if df_partition.empty:
-        df_partition['topic_id'] = pd.Series(dtype=np.int32)
+        df_partition["topic_id"] = pd.Series(dtype=np.int32)
         return df_partition
-    
+
     # Get unique app IDs in this partition
-    app_ids = df_partition['steam_appid'].astype(int).unique().tolist()
-    
+    app_ids = df_partition["steam_appid"].astype(int).unique().tolist()
+
     # Get embeddings only for app IDs in this partition
     local_theme_embeddings = get_theme_embeddings(app_ids, game_themes, embedder)
-    
+
     _ensure_embedder_device(embedder)
-    
-    reviews = df_partition['review'].fillna('').astype(str).tolist()
+
+    reviews = df_partition["review"].fillna("").astype(str).tolist()
     # Compute embeddings in one go with batching
     review_embeds = embedder.encode(
-        reviews,
-        convert_to_numpy=True,
-        batch_size=64,
-        show_progress_bar=False
+        reviews, convert_to_numpy=True, batch_size=64, show_progress_bar=False
     )
-    
+
     # Assign topics in app-id batches to avoid per-row cosine calls.
-    appid_array = df_partition['steam_appid'].astype(int).to_numpy()
+    appid_array = df_partition["steam_appid"].astype(int).to_numpy()
     topic_ids = np.zeros(len(df_partition), dtype=np.int32)
     for appid in np.unique(appid_array):
         idx = np.where(appid_array == appid)[0]
@@ -122,5 +115,5 @@ def assign_topic(df_partition: pd.DataFrame, game_themes: Dict[int, Dict[str, Li
         sims = cosine_similarity(review_embeds[idx], theme_embs)
         topic_ids[idx] = sims.argmax(axis=1).astype(np.int32)
 
-    df_partition['topic_id'] = topic_ids.tolist()
-    return df_partition 
+    df_partition["topic_id"] = topic_ids.tolist()
+    return df_partition

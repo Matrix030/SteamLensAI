@@ -1,0 +1,30 @@
+line-length = 100
+target-version = "py38"
+extend-exclude = [
+  "steamlensai/frontend",
+  "steamLensAI.egg-info",
+]
+
+[lint]
+select = [
+  "E",
+  "F",
+  "W",
+  "I",
+  "B",
+  "UP",
+  "SIM",
+  "C90",
+]
+ignore = ["E501"]
+
+[lint.mccabe]
+max-complexity = 15
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401", "F403", "F405"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
